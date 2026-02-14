@@ -1,8 +1,6 @@
 import AppKit
 import OSLog
-import SQLite3
 import UniformTypeIdentifiers
-import iMessage
 
 private let log = Logger.service("messages")
 private let messagesDatabasePath = "/Users/\(NSUserName())/Library/Messages/chat.db"
@@ -117,51 +115,111 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
             }
 
             let searchTerm = arguments["query"]?.stringValue
-            let limit = arguments["limit"]?.intValue
+            let limit = arguments["limit"]?.intValue ?? defaultLimit
 
-            let db = try self.createDatabaseConnection()
-            var messages: [[String: Value]] = []
-
-            log.debug("Fetching handles for participants: \(participants)")
-            let handles = try db.fetchParticipant(matching: participants)
-
-            log.debug(
-                "Fetching messages with date range: \(String(describing: dateRange)), limit: \(limit ?? -1)"
+            let msgDB = try self.createMessageDatabase()
+            let fetched = try msgDB.fetchMessages(
+                participants: participants,
+                dateRange: dateRange,
+                searchTerm: searchTerm,
+                limit: limit
             )
-            for message in try db.fetchMessages(
-                with: Set(handles),
-                in: dateRange,
-                limit: max(limit ?? defaultLimit, 1024)
-            ) {
-                guard messages.count < (limit ?? defaultLimit) else { break }
-                guard !message.text.isEmpty else { continue }
 
-                let sender: String
-                if message.isFromMe {
-                    sender = "me"
-                } else if message.sender == nil {
-                    sender = "unknown"
-                } else {
-                    sender = message.sender!.rawValue
+            var messages: [[String: Value]] = []
+            for msg in fetched {
+                let sender = msg.isFromMe ? "me" : (msg.sender ?? "unknown")
+
+                var entry: [String: Value] = [
+                    "@id": .string(msg.guid),
+                    "sender": .object(["@id": .string(sender)]),
+                    "text": .string(msg.text),
+                    "createdAt": .string(msg.date.formatted(.iso8601)),
+                ]
+
+                if let subject = msg.subject, !subject.isEmpty {
+                    entry["subject"] = .string(subject)
                 }
 
-                if let searchTerm {
-                    guard message.text.localizedCaseInsensitiveContains(searchTerm) else {
-                        continue
+                if msg.hasAttachments {
+                    let attachments = (try? msgDB.fetchAttachments(forMessageRowID: msg.rowID)) ?? []
+                    if !attachments.isEmpty {
+                        entry["attachments"] = .array(attachments.map { a in
+                            .object([
+                                "filename": .string(a.filename ?? "unknown"),
+                                "mimeType": .string(a.mimeType ?? "application/octet-stream"),
+                                "totalBytes": .int(Int(a.totalBytes)),
+                            ])
+                        })
                     }
                 }
 
-                messages.append([
-                    "@id": .string(message.id.description),
-                    "sender": [
-                        "@id": .string(sender)
-                    ],
-                    "text": .string(message.text),
-                    "createdAt": .string(message.date.formatted(.iso8601)),
-                ])
+                messages.append(entry)
             }
 
             log.debug("Successfully fetched \(messages.count) messages")
+            return [
+                "@context": "https://schema.org",
+                "@type": "Conversation",
+                "hasPart": Value.array(messages.map({ .object($0) })),
+            ]
+        }
+
+        Tool(
+            name: "messages_unread",
+            description: "Fetch unread inbound messages from the Messages app",
+            inputSchema: .object(
+                properties: [
+                    "limit": .integer(
+                        description: "Maximum messages to return",
+                        default: .int(10)
+                    ),
+                ],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Fetch Unread Messages",
+                readOnlyHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            log.debug("Starting unread message fetch")
+            try await self.activate()
+
+            let limit = arguments["limit"]?.intValue ?? 10
+            let msgDB = try self.createMessageDatabase()
+            let fetched = try msgDB.fetchUnreadMessages(limit: limit)
+
+            var messages: [[String: Value]] = []
+            for msg in fetched {
+                var entry: [String: Value] = [
+                    "@id": .string(msg.guid),
+                    "sender": .object(["@id": .string(msg.sender ?? "unknown")]),
+                    "text": .string(msg.text),
+                    "createdAt": .string(msg.date.formatted(.iso8601)),
+                    "isRead": .bool(msg.isRead),
+                ]
+
+                if let subject = msg.subject, !subject.isEmpty {
+                    entry["subject"] = .string(subject)
+                }
+
+                if msg.hasAttachments {
+                    let attachments = (try? msgDB.fetchAttachments(forMessageRowID: msg.rowID)) ?? []
+                    if !attachments.isEmpty {
+                        entry["attachments"] = .array(attachments.map { a in
+                            .object([
+                                "filename": .string(a.filename ?? "unknown"),
+                                "mimeType": .string(a.mimeType ?? "application/octet-stream"),
+                                "totalBytes": .int(Int(a.totalBytes)),
+                            ])
+                        })
+                    }
+                }
+
+                messages.append(entry)
+            }
+
+            log.debug("Successfully fetched \(messages.count) unread messages")
             return [
                 "@context": "https://schema.org",
                 "@type": "Conversation",
@@ -265,14 +323,14 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
         )
     }
 
-    private func createDatabaseConnection() throws -> iMessage.Database {
+    private func createMessageDatabase() throws -> MessageDatabase {
         if canAccessDatabaseAtDefaultPath {
-            return try iMessage.Database()
+            return MessageDatabase(path: messagesDatabasePath)
         }
 
         let databaseURL = try resolveBookmarkURL()
         return try withSecurityScopedAccess(databaseURL) { url in
-            try iMessage.Database(path: url.path)
+            MessageDatabase(path: url.path)
         }
     }
 
