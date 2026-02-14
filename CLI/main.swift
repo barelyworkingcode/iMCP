@@ -4,8 +4,7 @@ import Network
 import ServiceLifecycle
 import SystemPackage
 
-import struct Foundation.Data
-import class Foundation.RunLoop
+import Foundation
 
 var log = Logger(label: "me.mattt.iMCP.server") { StreamLogHandler.standardError(label: $0) }
 #if DEBUG
@@ -15,7 +14,6 @@ var log = Logger(label: "me.mattt.iMCP.server") { StreamLogHandler.standardError
 #endif
 
 // Network setup
-let serviceType = "_mcp._tcp"
 let parameters = NWParameters.tcp
 parameters.acceptLocalOnly = true
 parameters.includePeerToPeer = false
@@ -23,13 +21,6 @@ parameters.includePeerToPeer = false
 if let tcpOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
     tcpOptions.version = .v4
 }
-
-// Create browser at top level
-let browser = NWBrowser(
-    for: .bonjour(type: serviceType, domain: nil),
-    using: parameters
-)
-log.info("Created Bonjour browser for service type: \(serviceType)")
 
 actor ConnectionState {
     private var hasResumed = false
@@ -471,109 +462,40 @@ enum StdioProxyError: Swift.Error {
 
 // Create MCPService class to manage lifecycle
 actor MCPService: Service {
-    private var browser: NWBrowser?
     private var currentProxy: StdioProxy?
+
+    private static var portFileURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("iMCP/server.port")
+    }
+
+    /// Reads the port from the iMCP port file, waiting up to 30 seconds for it to appear.
+    private func discoverPort() async throws -> UInt16 {
+        let url = Self.portFileURL
+        let deadline = ContinuousClock.now + .seconds(30)
+
+        while ContinuousClock.now < deadline {
+            if let contents = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let port = UInt16(contents), port > 0 {
+                await log.info("Read port \(port) from \(url.path)")
+                return port
+            }
+            try await Task.sleep(for: .milliseconds(500))
+        }
+
+        await log.error("Port file discovery timed out after 30 seconds")
+        throw MCPError.internalError("Port file not found at \(url.path). Is iMCP running?")
+    }
 
     func run() async throws {
         while true {
             do {
-                await log.info("Starting Bonjour service discovery...")
+                await log.info("Discovering iMCP port via port file...")
 
-                let browser = NWBrowser(
-                    for: .bonjour(type: serviceType, domain: nil),
-                    using: parameters
-                )
-                self.browser = browser
+                let port = try await discoverPort()
+                let endpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!)
 
-                // Find and connect to iMCP app with improved reliability
-                let endpoint: NWEndpoint = try await withCheckedThrowingContinuation {
-                    continuation in
-                    let connectionState = ConnectionState()
-
-                    // Set up a timeout task to ensure we don't wait forever
-                    let timeoutTask = Task {
-                        // Allow 30 seconds to find the service
-                        try await Task.sleep(for: .seconds(30))
-
-                        // If we haven't found a service by now, resume with an error
-                        if await connectionState.checkAndSetResumed() {
-                            await log.error("Bonjour service discovery timed out after 30 seconds")
-                            continuation.resume(
-                                throwing: MCPError.internalError("Service discovery timeout")
-                            )
-                        }
-                    }
-
-                    // Convert async handlers to sync handlers
-                    browser.stateUpdateHandler = { state in
-                        Task {
-                            switch state {
-                            case .failed(let error):
-                                await log.error("Browser failed: \(error)")
-                                if await connectionState.checkAndSetResumed() {
-                                    timeoutTask.cancel()
-                                    browser.cancel()
-                                    continuation.resume(throwing: error)
-                                }
-                            case .ready:
-                                await log.info("Browser is ready and searching for services")
-                            case .waiting(let error):
-                                await log.warning("Browser is waiting: \(error)")
-                            default:
-                                await log.debug("Browser state changed: \(state)")
-                            }
-                        }
-                    }
-
-                    browser.browseResultsChangedHandler = { results, changes in
-                        Task {
-                            await log.debug("Found \(results.count) Bonjour services")
-
-                            // Log all discovered services for debugging
-                            for (index, result) in results.enumerated() {
-                                await log.debug("Service \(index + 1): \(result.endpoint)")
-                            }
-
-                            // If we have results, select the most appropriate one
-                            if !results.isEmpty {
-                                // First, try to find a service with "iMCP" in the endpoint description
-                                let imcpServices = results.filter {
-                                    String(describing: $0.endpoint).contains("iMCP")
-                                }
-
-                                let selectedService: NWBrowser.Result
-
-                                if !imcpServices.isEmpty {
-                                    // Prefer services with iMCP in the description
-                                    selectedService = imcpServices.first!
-                                    await log.info(
-                                        "Selected iMCP service: \(selectedService.endpoint)"
-                                    )
-                                } else {
-                                    // Fall back to the first available service
-                                    selectedService = results.first!
-                                    await log.info(
-                                        "No specific iMCP service found, using: \(selectedService.endpoint)"
-                                    )
-                                }
-
-                                if await connectionState.checkAndSetResumed() {
-                                    timeoutTask.cancel()
-                                    browser.cancel()
-                                    await log.info("Selected endpoint: \(selectedService.endpoint)")
-                                    continuation.resume(returning: selectedService.endpoint)
-                                }
-                            }
-                        }
-                    }
-
-                    Task {
-                        await log.info("Starting Bonjour browser to discover MCP services...")
-                    }
-                    browser.start(queue: .main)
-                }
-
-                await log.info("Creating connection to endpoint...")
+                await log.info("Creating connection to 127.0.0.1:\(port)...")
 
                 // Create the proxy
                 let proxy = StdioProxy(
@@ -588,11 +510,6 @@ actor MCPService: Service {
                     try await proxy.start()
                 } catch let error as StdioProxyError {
                     switch error {
-                    // Removed stdinTimeout case as it's no longer thrown
-                    // case .stdinTimeout:
-                    //     await log.info("Stdin timed out, will reconnect...")
-                    //     try await Task.sleep(for: .seconds(1))
-                    //     continue
                     case .networkTimeout:
                         await log.info("Network timed out, will reconnect...")
                         try await Task.sleep(for: .seconds(1))
@@ -602,15 +519,12 @@ actor MCPService: Service {
                         return
                     }
                 } catch let error as NWError where error.errorCode == 54 || error.errorCode == 57 {
-                    // Handle connection reset by peer (54) or socket not connected (57)
                     await log.critical("Network connection terminated: \(error), shutting down...")
                     return
                 } catch {
-                    // Rethrow other errors to be handled by the outer catch block
                     throw error
                 }
             } catch {
-                // Handle all other errors with retry
                 await log.error("Connection error: \(error)")
                 await log.info("Will retry connection in 5 seconds...")
                 try await Task.sleep(for: .seconds(5))
@@ -619,7 +533,6 @@ actor MCPService: Service {
     }
 
     func shutdown() async throws {
-        browser?.cancel()
         if let proxy = currentProxy {
             await proxy.stop()
         }

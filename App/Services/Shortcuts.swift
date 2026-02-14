@@ -56,10 +56,33 @@ final class ShortcutsService: Service {
                 )
             }
 
+            guard self.isShortcutAllowed(name) else {
+                log.warning("Shortcut '\(name, privacy: .public)' is not in the allowlist")
+                throw NSError(
+                    domain: "ShortcutsError",
+                    code: 7,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Shortcut '\(name)' is not in the allowlist. Add it in Settings > Shortcuts."
+                    ]
+                )
+            }
+
             let input = arguments["input"]?.stringValue
 
             return try await self.runShortcut(name: name, input: input)
         }
+    }
+
+    // MARK: - Allowlist
+
+    private func isShortcutAllowed(_ name: String) -> Bool {
+        guard let data = UserDefaults.standard.data(forKey: "allowedShortcuts"),
+              let allowed = try? JSONDecoder().decode(Set<String>.self, from: data)
+        else {
+            return false
+        }
+        return allowed.contains(name)
     }
 
     // MARK: - Private Implementation

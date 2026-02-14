@@ -12,9 +12,6 @@ import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
 
-private let serviceType = "_mcp._tcp"
-private let serviceDomain = "local."
-
 private let log = Logger.server
 
 struct ServiceConfig: Identifiable {
@@ -161,6 +158,7 @@ final class ServerController: ObservableObject {
     private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
     private var currentApprovalHandlers: (approve: () -> Void, deny: () -> Void)?
     private let approvalWindowController = ConnectionApprovalWindowController()
+    private let toolApprovalWindowController = ToolApprovalWindowController()
 
     private let networkManager = ServerNetworkManager()
 
@@ -178,6 +176,13 @@ final class ServerController: ObservableObject {
 
     // MARK: - AppStorage for Trusted Clients
     @AppStorage("trustedClients") private var trustedClientsData = Data()
+
+    // MARK: - AppStorage for Per-Tool Approvals
+    // Maps client name -> set of approved tool names, stored as JSON.
+    @AppStorage("toolApprovals") private var toolApprovalsData = Data()
+
+    // MARK: - AppStorage for Shortcuts Allowlist
+    @AppStorage("allowedShortcuts") private var allowedShortcutsData = Data()
 
     // MARK: - Computed Properties for Service Configurations and Bindings
     var computedServiceConfigs: [ServiceConfig] {
@@ -237,6 +242,77 @@ final class ServerController: ObservableObject {
         trustedClients = Set<String>()
     }
 
+    // MARK: - Per-Tool Approvals Management
+    private var toolApprovals: [String: Set<String>] {
+        get {
+            (try? JSONDecoder().decode([String: Set<String>].self, from: toolApprovalsData)) ?? [:]
+        }
+        set {
+            toolApprovalsData = (try? JSONEncoder().encode(newValue)) ?? Data()
+        }
+    }
+
+    func isToolApproved(client: String, tool: String) -> Bool {
+        toolApprovals[client]?.contains(tool) ?? false
+    }
+
+    func approveToolForClient(client: String, tool: String) {
+        var approvals = toolApprovals
+        var clientTools = approvals[client] ?? []
+        clientTools.insert(tool)
+        approvals[client] = clientTools
+        toolApprovals = approvals
+    }
+
+    func getToolApprovals() -> [(client: String, tool: String)] {
+        toolApprovals.flatMap { client, tools in
+            tools.map { (client: client, tool: $0) }
+        }.sorted { ($0.client, $0.tool) < ($1.client, $1.tool) }
+    }
+
+    func revokeToolApproval(client: String, tool: String) {
+        var approvals = toolApprovals
+        approvals[client]?.remove(tool)
+        if approvals[client]?.isEmpty == true {
+            approvals.removeValue(forKey: client)
+        }
+        toolApprovals = approvals
+    }
+
+    func resetToolApprovals() {
+        toolApprovals = [:]
+    }
+
+    // MARK: - Shortcuts Allowlist Management
+    private var allowedShortcuts: Set<String> {
+        get {
+            (try? JSONDecoder().decode(Set<String>.self, from: allowedShortcutsData)) ?? []
+        }
+        set {
+            allowedShortcutsData = (try? JSONEncoder().encode(newValue)) ?? Data()
+        }
+    }
+
+    func isShortcutAllowed(_ name: String) -> Bool {
+        allowedShortcuts.contains(name)
+    }
+
+    func addAllowedShortcut(_ name: String) {
+        var shortcuts = allowedShortcuts
+        shortcuts.insert(name)
+        allowedShortcuts = shortcuts
+    }
+
+    func removeAllowedShortcut(_ name: String) {
+        var shortcuts = allowedShortcuts
+        shortcuts.remove(name)
+        allowedShortcuts = shortcuts
+    }
+
+    func getAllowedShortcuts() -> [String] {
+        Array(allowedShortcuts).sorted()
+    }
+
     // MARK: - Connection Approval Methods
     private func cleanupApprovalState() {
         pendingClientName = ""
@@ -291,6 +367,42 @@ final class ServerController: ObservableObject {
                                 Task { await resumeOnce(true) }
                             },
                             deny: {
+                                Task { await resumeOnce(false) }
+                            }
+                        )
+                    }
+                }
+            }
+
+            await networkManager.setToolApprovalHandler {
+                [weak self] clientName, toolName in
+                guard let self = self else { return false }
+
+                // Check if already approved.
+                let alreadyApproved = await MainActor.run {
+                    self.isToolApproved(client: clientName, tool: toolName)
+                }
+                if alreadyApproved { return true }
+
+                // Show approval dialog.
+                return await withCheckedContinuation { continuation in
+                    let resumeGate = ResumeGate()
+                    let resumeOnce: (Bool) async -> Void = { value in
+                        guard await resumeGate.shouldResume() else { return }
+                        continuation.resume(returning: value)
+                    }
+
+                    Task { @MainActor in
+                        self.toolApprovalWindowController.showApprovalWindow(
+                            clientName: clientName,
+                            toolName: toolName,
+                            onApprove: { alwaysAllow in
+                                if alwaysAllow {
+                                    self.approveToolForClient(client: clientName, tool: toolName)
+                                }
+                                Task { await resumeOnce(true) }
+                            },
+                            onDeny: {
                                 Task { await resumeOnce(false) }
                             }
                         )
@@ -423,6 +535,7 @@ actor MCPConnectionManager {
     private let server: MCP.Server
     private var transport: NetworkTransport
     private let parentManager: ServerNetworkManager
+    private(set) var clientName: String?
 
     init(connectionID: UUID, connection: NWConnection, parentManager: ServerNetworkManager) {
         self.connectionID = connectionID
@@ -453,6 +566,9 @@ actor MCPConnectionManager {
 
                 log.info("Received initialize request from client: \(clientInfo.name)")
 
+                // Store the client name for later use in tool approval.
+                await self.setClientName(clientInfo.name)
+
                 // Request user approval for the connection.
                 let approved = await approvalHandler(clientInfo)
                 log.info(
@@ -478,8 +594,12 @@ actor MCPConnectionManager {
         }
     }
 
+    private func setClientName(_ name: String) {
+        self.clientName = name
+    }
+
     private func registerHandlers() async {
-        await parentManager.registerHandlers(for: server, connectionID: connectionID)
+        await parentManager.registerHandlers(for: server, connectionID: connectionID, clientName: clientName)
     }
 
     private func startHealthMonitoring() async {
@@ -531,18 +651,16 @@ actor MCPConnectionManager {
     }
 }
 
-// Manages Bonjour service discovery and advertisement.
+// Manages the TCP listener (localhost-only, no Bonjour advertisement).
 actor NetworkDiscoveryManager {
-    private let serviceType: String
-    private let serviceDomain: String
     var listener: NWListener
-    private let browser: NWBrowser
 
-    init(serviceType: String, serviceDomain: String) throws {
-        self.serviceType = serviceType
-        self.serviceDomain = serviceDomain
+    private static var portFileURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("iMCP/server.port")
+    }
 
-        // Local-only Bonjour advertisement.
+    init() throws {
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         parameters.includePeerToPeer = false
@@ -553,17 +671,9 @@ actor NetworkDiscoveryManager {
             tcpOptions.version = .v4
         }
 
-        // Listen and advertise via Bonjour.
         self.listener = try NWListener(using: parameters)
-        self.listener.service = NWListener.Service(type: serviceType, domain: serviceDomain)
 
-        // Browser is used for monitoring and diagnostics.
-        self.browser = NWBrowser(
-            for: .bonjour(type: serviceType, domain: serviceDomain),
-            using: parameters
-        )
-
-        log.info("Network discovery manager initialized with Bonjour service type: \(serviceType)")
+        log.info("Network discovery manager initialized (localhost-only, no Bonjour)")
     }
 
     func start(
@@ -571,26 +681,46 @@ actor NetworkDiscoveryManager {
         connectionHandler: @escaping @Sendable (NWConnection) -> Void
     ) {
         listener.stateUpdateHandler = stateHandler
-
         listener.newConnectionHandler = connectionHandler
-
         listener.start(queue: .main)
-        browser.start(queue: .main)
 
-        log.info("Started network discovery and advertisement")
+        log.info("Started TCP listener")
     }
 
     func stop() {
         listener.cancel()
-        browser.cancel()
-        log.info("Stopped network discovery and advertisement")
+        Self.removePortFile()
+        log.info("Stopped TCP listener and removed port file")
+    }
+
+    func writePortFile() {
+        guard let port = listener.port else {
+            log.error("Cannot write port file: listener has no port")
+            return
+        }
+
+        let url = Self.portFileURL
+        let dir = url.deletingLastPathComponent()
+
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try "\(port.rawValue)".write(to: url, atomically: true, encoding: .utf8)
+            log.info("Wrote port file: \(url.path) with port \(port.rawValue)")
+        } catch {
+            log.error("Failed to write port file: \(error)")
+        }
+    }
+
+    static func removePortFile() {
+        try? FileManager.default.removeItem(at: portFileURL)
+        log.info("Removed port file")
     }
 
     func restartWithRandomPort() async throws {
         listener.cancel()
+        Self.removePortFile()
 
-        // Recreate listener on an ephemeral port.
-        let parameters: NWParameters = NWParameters.tcp  // Explicit type
+        let parameters: NWParameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         parameters.includePeerToPeer = false
 
@@ -601,8 +731,6 @@ actor NetworkDiscoveryManager {
         }
 
         let newListener: NWListener = try NWListener(using: parameters)
-        let service = NWListener.Service(type: self.serviceType, domain: self.serviceDomain)
-        newListener.service = service
 
         if let currentStateHandler = listener.stateUpdateHandler {
             newListener.stateUpdateHandler = currentStateHandler
@@ -631,15 +759,16 @@ actor ServerNetworkManager {
     typealias ConnectionApprovalHandler = @Sendable (UUID, MCP.Client.Info) async -> Bool
     private var connectionApprovalHandler: ConnectionApprovalHandler?
 
+    /// Returns true if the tool is approved (or user approved it now).
+    typealias ToolApprovalHandler = @Sendable (String, String) async -> Bool  // (clientName, toolName)
+    private var toolApprovalHandler: ToolApprovalHandler?
+
     private let services = ServiceRegistry.services
     private var serviceBindings: [String: Binding<Bool>] = [:]
 
     init() {
         do {
-            self.discoveryManager = try NetworkDiscoveryManager(
-                serviceType: serviceType,
-                serviceDomain: serviceDomain
-            )
+            self.discoveryManager = try NetworkDiscoveryManager()
         } catch {
             log.error("Failed to initialize network discovery manager: \(error)")
         }
@@ -652,6 +781,11 @@ actor ServerNetworkManager {
     func setConnectionApprovalHandler(_ handler: @escaping ConnectionApprovalHandler) {
         log.debug("Setting connection approval handler")
         self.connectionApprovalHandler = handler
+    }
+
+    func setToolApprovalHandler(_ handler: @escaping ToolApprovalHandler) {
+        log.debug("Setting tool approval handler")
+        self.toolApprovalHandler = handler
     }
 
     func start() async {
@@ -718,7 +852,8 @@ actor ServerNetworkManager {
     private func handleListenerStateChange(_ state: NWListener.State) async {
         switch state {
         case .ready:
-            log.info("Server ready and advertising via Bonjour as \(serviceType)")
+            log.info("Server ready and listening on localhost")
+            await discoveryManager?.writePortFile()
         case .setup:
             log.debug("Server setting up...")
         case .waiting(let error):
@@ -766,6 +901,7 @@ actor ServerNetworkManager {
         pendingConnections.removeAll()
 
         await discoveryManager?.stop()
+        NetworkDiscoveryManager.removePortFile()
     }
 
     func removeConnection(_ id: UUID) async {
@@ -840,7 +976,7 @@ actor ServerNetworkManager {
         }
     }
 
-    func registerHandlers(for server: MCP.Server, connectionID: UUID) async {
+    func registerHandlers(for server: MCP.Server, connectionID: UUID, clientName: String? = nil) async {
         await server.withMethodHandler(ListPrompts.self) { _ in
             log.debug("Handling ListPrompts request for \(connectionID)")
             return ListPrompts.Result(prompts: [])
@@ -902,6 +1038,18 @@ actor ServerNetworkManager {
                     content: [.text("iMCP is currently disabled. Please enable it to use tools.")],
                     isError: true
                 )
+            }
+
+            // Per-tool approval check.
+            if let client = clientName, let approvalHandler = await self.toolApprovalHandler {
+                let approved = await approvalHandler(client, params.name)
+                if !approved {
+                    log.notice("Tool call denied by user: \(params.name) for client \(client)")
+                    return CallTool.Result(
+                        content: [.text("Tool '\(params.name)' was denied by the user.")],
+                        isError: true
+                    )
+                }
             }
 
             for service in await self.services {

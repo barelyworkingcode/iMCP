@@ -168,6 +168,47 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                 "hasPart": Value.array(messages.map({ .object($0) })),
             ]
         }
+
+        Tool(
+            name: "messages_send",
+            description: "Send an iMessage to a recipient",
+            inputSchema: .object(
+                properties: [
+                    "recipient": .string(
+                        description:
+                            "Recipient phone number (E.164 format) or email address"
+                    ),
+                    "message": .string(
+                        description: "The message text to send"
+                    ),
+                ],
+                required: ["recipient", "message"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Send Message",
+                destructiveHint: true,
+                openWorldHint: true
+            )
+        ) { arguments in
+            guard case let .string(recipient) = arguments["recipient"], !recipient.isEmpty else {
+                throw NSError(
+                    domain: "MessagesError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Recipient is required"]
+                )
+            }
+
+            guard case let .string(message) = arguments["message"], !message.isEmpty else {
+                throw NSError(
+                    domain: "MessagesError",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Message text is required"]
+                )
+            }
+
+            return try await self.sendMessage(to: recipient, text: message)
+        }
     }
 
     private var canAccessDatabaseAtDefaultPath: Bool {
@@ -299,6 +340,104 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
         } catch {
             log.error("Failed to create bookmark: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Send Message
+
+    private let osascriptPath = "/usr/bin/osascript"
+    private let sendTimeout: Duration = .seconds(30)
+
+    private func runProcess(_ process: Process) async throws {
+        try process.run()
+        await withCheckedContinuation { continuation in
+            process.terminationHandler = { _ in
+                continuation.resume()
+            }
+        }
+    }
+
+    private func sendMessage(to recipient: String, text: String) async throws -> Value {
+        log.info("Sending message to: \(recipient, privacy: .private)")
+
+        let escapedMessage = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedRecipient = recipient
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+
+        let script = """
+            tell application "Messages"
+                set targetService to 1st service whose service type = iMessage
+                send "\(escapedMessage)" to buddy "\(escapedRecipient)" of targetService
+            end tell
+            """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: osascriptPath)
+        process.arguments = ["-e", script]
+
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        let errorHandle = errorPipe.fileHandleForReading
+        defer { errorHandle.closeFile() }
+
+        var errorData = Data()
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await self.runProcess(process)
+                }
+
+                group.addTask {
+                    try await Task.sleep(for: self.sendTimeout)
+                    process.terminate()
+                    throw NSError(
+                        domain: "MessagesError",
+                        code: 3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Message send timed out after \(Int(self.sendTimeout.components.seconds)) seconds"
+                        ]
+                    )
+                }
+
+                _ = try await group.next()
+                group.cancelAll()
+            }
+        } catch {
+            if process.isRunning {
+                process.terminate()
+            }
+            errorData = (try? errorHandle.readToEnd()) ?? Data()
+            if !errorData.isEmpty {
+                let stderrMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+                log.error("Message send stderr: \(stderrMessage, privacy: .public)")
+            }
+            log.error("Failed to send message: \(error.localizedDescription)")
+            throw error
+        }
+
+        if errorData.isEmpty {
+            errorData = (try? errorHandle.readToEnd()) ?? Data()
+        }
+
+        guard process.terminationStatus == 0 else {
+            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            log.error("Message send failed: \(errorMessage)")
+            throw NSError(
+                domain: "MessagesError",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to send message: \(errorMessage)"]
+            )
+        }
+
+        log.info("Message sent successfully to: \(recipient, privacy: .private)")
+
+        return .object([
+            "success": .bool(true),
+            "recipient": .string(recipient),
+        ])
     }
 
     // NSOpenSavePanelDelegate method to constrain file selection
