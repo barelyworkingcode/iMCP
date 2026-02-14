@@ -10,6 +10,7 @@
 	<array>
 		<string>com.apple.Terminal</string>
 		<string>com.apple.iChat</string>
+		<string>com.apple.Mail</string>
 	</array>
 	<key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
 	<array>
