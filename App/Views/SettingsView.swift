@@ -8,6 +8,7 @@ struct SettingsView: View {
         case general = "General"
         case toolApprovals = "Tool Approvals"
         case shortcuts = "Shortcuts"
+        case automation = "Automation"
 
         var id: String { self.rawValue }
 
@@ -16,6 +17,7 @@ struct SettingsView: View {
             case .general: return "gear"
             case .toolApprovals: return "checkmark.shield"
             case .shortcuts: return "square.2.layers.3d"
+            case .automation: return "gearshape.2"
             }
         }
     }
@@ -51,6 +53,10 @@ struct SettingsView: View {
                 case .shortcuts:
                     ShortcutsSettingsView(serverController: serverController)
                         .navigationTitle("Shortcuts")
+                        .formStyle(.grouped)
+                case .automation:
+                    AutomationSettingsView(serverController: serverController)
+                        .navigationTitle("Automation")
                         .formStyle(.grouped)
                 }
             } else {
@@ -300,5 +306,60 @@ struct ShortcutsSettingsView: View {
         guard !name.isEmpty else { return }
         serverController.addAllowedShortcut(name)
         newShortcutName = ""
+    }
+}
+
+struct AutomationSettingsView: View {
+    @ObservedObject var serverController: ServerController
+
+    var body: some View {
+        Form {
+            Section {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Message Watcher")
+                        .font(.headline)
+
+                    Text("Run a script when new inbound iMessages are detected.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.bottom, 4)
+
+                Toggle("Run script on new messages", isOn: Binding(
+                    get: { serverController.messageWatcherEnabled },
+                    set: {
+                        serverController.messageWatcherEnabled = $0
+                        serverController.updateMessageWatcher()
+                    }
+                ))
+
+                HStack {
+                    TextField(
+                        "Script path",
+                        text: Binding(
+                            get: { serverController.messageWatcherScript },
+                            set: { serverController.messageWatcherScript = $0 }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    Button("Browse...") {
+                        let panel = NSOpenPanel()
+                        panel.allowedContentTypes = [.unixExecutable, .shellScript, .script, .item]
+                        panel.canChooseDirectories = false
+                        panel.allowsMultipleSelection = false
+                        if panel.runModal() == .OK, let url = panel.url {
+                            serverController.messageWatcherScript = url.path
+                            serverController.updateMessageWatcher()
+                        }
+                    }
+                }
+
+                Text("The script receives IMCP_NEW_MESSAGE_COUNT as an environment variable. Requires the Messages service to be enabled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }

@@ -31,5 +31,8 @@ playground.xcworkspace
 
 .build/
 
+# Build artifacts
+build/
+
 # Release artifacts
 dist/

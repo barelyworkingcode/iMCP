@@ -184,6 +184,12 @@ final class ServerController: ObservableObject {
     // MARK: - AppStorage for Shortcuts Allowlist
     @AppStorage("allowedShortcuts") private var allowedShortcutsData = Data()
 
+    // MARK: - AppStorage for Message Watcher
+    @AppStorage("messageWatcherEnabled") var messageWatcherEnabled = false
+    @AppStorage("messageWatcherScript") var messageWatcherScript = ""
+
+    private var messageWatcher: MessageWatcher?
+
     // MARK: - Computed Properties for Service Configurations and Bindings
     var computedServiceConfigs: [ServiceConfig] {
         ServiceRegistry.configureServices(
@@ -313,6 +319,22 @@ final class ServerController: ObservableObject {
         Array(allowedShortcuts).sorted()
     }
 
+    // MARK: - Message Watcher Management
+
+    func updateMessageWatcher() {
+        let shouldRun = messagesEnabled && messageWatcherEnabled && !messageWatcherScript.isEmpty
+        if shouldRun {
+            // Restart if script path changed.
+            messageWatcher?.stop()
+            let watcher = MessageWatcher(scriptPath: messageWatcherScript)
+            watcher.start()
+            messageWatcher = watcher
+        } else {
+            messageWatcher?.stop()
+            messageWatcher = nil
+        }
+    }
+
     // MARK: - Connection Approval Methods
     private func cleanupApprovalState() {
         pendingClientName = ""
@@ -343,6 +365,7 @@ final class ServerController: ObservableObject {
             await networkManager.updateServiceBindings(self.currentServiceBindings)
             await self.networkManager.start()
             self.updateServerStatus("Running")
+            self.updateMessageWatcher()
 
             await networkManager.setConnectionApprovalHandler {
                 [weak self] connectionID, clientInfo in
