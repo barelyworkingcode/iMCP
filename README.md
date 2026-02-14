@@ -4,6 +4,12 @@
   <img alt="iMCP">
 </picture>
 
+> **Note:** This is a hardened fork of [mattt/iMCP](https://github.com/mattt/iMCP).
+> Because iMCP accesses sensitive personal data (messages, contacts, calendars, location),
+> we've removed automatic updates and directly integrated all third-party dependencies
+> into the repository to ensure full auditability of what runs on your machine.
+> Thanks to [Mattt](https://github.com/mattt) and all contributors for the original project.
+
 iMCP is a macOS app for connecting your digital life with AI.
 It works with [Claude Desktop][claude-app]
 and a [growing list of clients][mcp-clients] that support the
