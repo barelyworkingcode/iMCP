@@ -6,10 +6,40 @@ macOS MCP server that exposes system services (Calendar, Contacts, Messages, Mai
 
 Two components:
 
-- **iMCP.app** -- SwiftUI menu bar app. Manages permissions, service toggles, connection approval, and the TCP listener. All services run in-process.
-- **CLI (`CLI/main.swift`)** -- stdio-to-TCP proxy (`imcp-server`). MCP clients (Claude Desktop, etc.) launch this binary; it discovers the app's port via `~/Library/Application Support/iMCP/server.port` and bridges JSON-RPC over stdin/stdout.
+- **iMCP.app** -- SwiftUI menu bar app. Manages permissions, service toggles, token authentication, and the TCP listener. All services run in-process.
+- **CLI (`CLI/main.swift`)** -- stdio-to-TCP proxy (`imcp-server`). MCP clients (Claude Desktop, etc.) launch this binary; it discovers the app's port via `~/Library/Application Support/iMCP/server.port` (0600) and bridges JSON-RPC over stdin/stdout. Requires `--token <hex>` argument.
 
-`ServerController.swift` owns the `ServiceRegistry` (line ~48), service configs with UI metadata, trusted clients, per-tool approvals, and shortcuts allowlist. `ServerNetworkManager` (actor) handles the TCP listener, connection lifecycle, and MCP handler registration.
+`ServerController.swift` owns the `ServiceRegistry`, service configs with UI metadata, auth tokens with per-service permissions, and shortcuts allowlist. `ServerNetworkManager` (actor) handles the TCP listener, token validation, connection lifecycle, and MCP handler registration with permission enforcement.
+
+## Token Authentication
+
+Connections are authenticated via pre-shared tokens. No runtime approval dialogs.
+
+**Flow:** CLI sends `token\n` on raw TCP before MCP traffic -> server validates with constant-time compare -> creates `MCPConnectionManager` with matched `AuthToken` -> MCP handshake proceeds -> `ListTools`/`CallTool` filtered by token permissions.
+
+**Types** (in `ServerController.swift`):
+
+```swift
+enum ServicePermission: String, Codable, CaseIterable {
+    case off        // no access
+    case readOnly   // only tools where readOnlyHint == true
+    case full       // all tools
+}
+
+struct AuthToken: Codable, Identifiable {
+    let id: UUID
+    let name: String         // e.g. "Claude Desktop"
+    let token: String        // 64-char hex (32 bytes via SecRandomCopyBytes)
+    let createdAt: Date
+    var permissions: [String: ServicePermission]  // serviceID -> permission
+}
+```
+
+`permissions` is keyed on service ID (e.g. `"CalendarService"`, `"ContactsService"`). Missing keys default to `.off`. Tokens are stored in `@AppStorage("authTokens")` as JSON.
+
+**CLI usage:** `imcp-server --token <64-char-hex>`
+
+**No tokens configured = all connections rejected.**
 
 ## Adding a New Service
 
@@ -53,14 +83,14 @@ final class MyService: Service {
 
 3. Register in `ServiceRegistry.services` array (`ServerController.swift:48`)
 4. Add `ServiceConfig` entry in `configureServices()` (`ServerController.swift:80`) with icon, color, and binding
-5. Add `@AppStorage` toggle in `ServerController` properties (~line 174)
+5. Add `@AppStorage` toggle in `ServerController` properties (~line 191)
 6. Add binding parameter to `configureServices()` signature and `computedServiceConfigs`
 
 ## Adding a Tool to an Existing Service
 
 Add a `Tool(...)` call inside the service's `@ToolBuilder var tools` body. Each tool needs: `name`, `description`, `inputSchema` (JSONSchema), `annotations` (MCP.Tool.Annotations), and an async throwing closure. The closure receives `[String: Value]` arguments and returns any `Encodable` type.
 
-Use `annotations.readOnlyHint = true` for read-only tools, `destructiveHint = true` for write operations.
+Use `annotations.readOnlyHint = true` for read-only tools, `destructiveHint = true` for write operations. The `readOnlyHint` annotation is load-bearing -- it controls whether a tool is accessible under `readOnly` permission.
 
 ## Coding Conventions
 
@@ -84,11 +114,13 @@ Requires Xcode 16+, macOS 15.3+. This is a hardened fork -- SPM dependencies are
 
 | Path | Purpose |
 |------|---------|
-| `App/Controllers/ServerController.swift` | Service registry, network manager, connection/tool approval |
+| `App/Controllers/ServerController.swift` | Service registry, auth tokens, network manager, permission enforcement |
+| `App/Integrations/ClaudeDesktop.swift` | Claude Desktop config generation (token + JSON) |
 | `App/Models/Service.swift` | `Service` protocol + `@ToolBuilder` |
 | `App/Models/Tool.swift` | `Tool` struct with name, schema, annotations, implementation |
 | `App/Models/Value.swift` | Re-exports `MCP.Value` |
 | `App/Services/*.swift` | One file per system service |
+| `App/Views/SettingsView.swift` | Security (token mgmt), Shortcuts, Automation settings |
 | `App/Extensions/Logger+Extensions.swift` | `Logger.service()` and `Logger.server` |
-| `CLI/main.swift` | stdio-to-TCP proxy binary |
+| `CLI/main.swift` | stdio-to-TCP proxy binary (`--token` arg) |
 | `.swift-format` | Formatter config |
