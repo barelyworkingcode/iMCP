@@ -1,12 +1,13 @@
+import AppKit
+import Foundation
 import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var serverController: ServerController
-    @State private var selectedSection: SettingsSection? = .general
+    @State private var selectedSection: SettingsSection? = .security
 
     enum SettingsSection: String, CaseIterable, Identifiable {
-        case general = "General"
-        case toolApprovals = "Tool Approvals"
+        case security = "Security"
         case shortcuts = "Shortcuts"
         case automation = "Automation"
 
@@ -14,8 +15,7 @@ struct SettingsView: View {
 
         var icon: String {
             switch self {
-            case .general: return "gear"
-            case .toolApprovals: return "checkmark.shield"
+            case .security: return "lock.shield"
             case .shortcuts: return "square.2.layers.3d"
             case .automation: return "gearshape.2"
             }
@@ -42,13 +42,9 @@ struct SettingsView: View {
 
             if let selectedSection {
                 switch selectedSection {
-                case .general:
-                    GeneralSettingsView(serverController: serverController)
-                        .navigationTitle("General")
-                        .formStyle(.grouped)
-                case .toolApprovals:
-                    ToolApprovalsSettingsView(serverController: serverController)
-                        .navigationTitle("Tool Approvals")
+                case .security:
+                    SecuritySettingsView(serverController: serverController)
+                        .navigationTitle("Security")
                         .formStyle(.grouped)
                 case .shortcuts:
                     ShortcutsSettingsView(serverController: serverController)
@@ -82,161 +78,261 @@ struct SettingsView: View {
 
 }
 
-struct GeneralSettingsView: View {
-    @ObservedObject var serverController: ServerController
-    @State private var showingResetAlert = false
-    @State private var selectedClients = Set<String>()
+// MARK: - Security Settings
 
-    private var trustedClients: [String] {
-        serverController.getTrustedClients()
+struct SecuritySettingsView: View {
+    @ObservedObject var serverController: ServerController
+    @State private var newTokenName = ""
+    @State private var generatedToken: AuthToken?
+    @State private var copiedTokenID: UUID?
+    @State private var selectedTokenID: UUID?
+    @State private var showingRevokeAllAlert = false
+
+    private var tokens: [AuthToken] {
+        serverController.getAuthTokens()
+    }
+
+    private var serviceConfigs: [ServiceConfig] {
+        serverController.computedServiceConfigs
     }
 
     var body: some View {
         Form {
+            // MARK: Token List
             Section {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
-                        Text("Trusted Clients")
+                        Text("Auth Tokens")
                             .font(.headline)
                         Spacer()
-                        if !trustedClients.isEmpty {
-                            Button("Remove All") {
-                                showingResetAlert = true
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(.red)
-                        }
-                    }
-
-                    Text("Clients that automatically connect without approval.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.bottom, 4)
-
-                if trustedClients.isEmpty {
-                    HStack {
-                        Text("No trusted clients")
-                            .foregroundStyle(.secondary)
-                            .italic()
-                        Spacer()
-                    }
-                    .padding(.vertical, 8)
-                } else {
-                    List(trustedClients, id: \.self, selection: $selectedClients) { client in
-                        HStack {
-                            Text(client)
-                                .font(.system(.body, design: .monospaced))
-                            Spacer()
-                        }
-                        .contextMenu {
-                            Button("Remove Client", role: .destructive) {
-                                serverController.removeTrustedClient(client)
-                            }
-                        }
-                    }
-                    .frame(minHeight: 100, maxHeight: 200)
-                    .onDeleteCommand {
-                        for clientID in selectedClients {
-                            serverController.removeTrustedClient(clientID)
-                        }
-                        selectedClients.removeAll()
-                    }
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .alert("Remove All Trusted Clients", isPresented: $showingResetAlert) {
-            Button("Cancel", role: .cancel) {}
-            Button("Remove All", role: .destructive) {
-                serverController.resetTrustedClients()
-                selectedClients.removeAll()
-            }
-        } message: {
-            Text(
-                "This will remove all trusted clients. They will need to be approved again when connecting."
-            )
-        }
-    }
-}
-
-struct ToolApprovalsSettingsView: View {
-    @ObservedObject var serverController: ServerController
-    @State private var showingResetAlert = false
-
-    private var approvals: [(client: String, tool: String)] {
-        serverController.getToolApprovals()
-    }
-
-    var body: some View {
-        Form {
-            Section {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Text("Approved Tools")
-                            .font(.headline)
-                        Spacer()
-                        if !approvals.isEmpty {
+                        if !tokens.isEmpty {
                             Button("Revoke All") {
-                                showingResetAlert = true
+                                showingRevokeAllAlert = true
                             }
                             .buttonStyle(.borderless)
                             .foregroundStyle(.red)
                         }
                     }
 
-                    Text("Tools that clients can use without prompting.")
+                    Text("Generate tokens for MCP clients. Pass via --token in the CLI.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.bottom, 4)
 
-                if approvals.isEmpty {
+                // Generate new token
+                HStack {
+                    TextField("Token name (e.g. Claude Desktop)", text: $newTokenName)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { generateToken() }
+                    Button("Generate") { generateToken() }
+                        .disabled(newTokenName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+
+                // Show generated token (one-time display)
+                if let generated = generatedToken {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Token generated for \"\(generated.name)\"")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+
+                        HStack {
+                            Text(generated.token)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .lineLimit(1)
+                            Spacer()
+                            Button("Copy Token") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(generated.token, forType: .string)
+                                copiedTokenID = generated.id
+                            }
+                            .buttonStyle(.bordered)
+                            Button("Copy MCP Config") {
+                                let command = Bundle.main.bundleURL
+                                    .appendingPathComponent("Contents/MacOS/imcp-server")
+                                    .path
+                                let configBlock: [String: Any] = [
+                                    "iMCP": [
+                                        "command": command,
+                                        "args": ["--token", generated.token],
+                                    ]
+                                ]
+                                if let data = try? JSONSerialization.data(
+                                    withJSONObject: configBlock,
+                                    options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                                ),
+                                    let json = String(data: data, encoding: .utf8)
+                                {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(json, forType: .string)
+                                    copiedTokenID = generated.id
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        if copiedTokenID == generated.id {
+                            Text("Copied to clipboard. This token will not be shown again.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        } else {
+                            Text("Copy this token now. It will not be shown again.")
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    .padding(8)
+                    .background(.quaternary.opacity(0.5))
+                    .cornerRadius(8)
+                }
+
+                // Token list
+                if tokens.isEmpty {
                     HStack {
-                        Text("No approved tools")
+                        Text("No tokens configured. All connections will be rejected.")
                             .foregroundStyle(.secondary)
                             .italic()
                         Spacer()
                     }
                     .padding(.vertical, 8)
                 } else {
-                    List(approvals, id: \.tool) { approval in
+                    List(tokens, selection: $selectedTokenID) { token in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(approval.tool)
-                                    .font(.system(.body, design: .monospaced))
-                                Text(approval.client)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                Text(token.name)
+                                    .fontWeight(.medium)
+                                HStack(spacing: 4) {
+                                    Text(maskedToken(token.token))
+                                        .font(.system(.caption, design: .monospaced))
+                                    Text("--")
+                                        .font(.caption)
+                                    Text(token.createdAt, style: .date)
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
                             }
                             Spacer()
                         }
+                        .tag(token.id)
                         .contextMenu {
                             Button("Revoke", role: .destructive) {
-                                serverController.revokeToolApproval(
-                                    client: approval.client,
-                                    tool: approval.tool
-                                )
+                                if selectedTokenID == token.id {
+                                    selectedTokenID = nil
+                                }
+                                serverController.revokeToken(id: token.id)
                             }
                         }
                     }
-                    .frame(minHeight: 100, maxHeight: 300)
+                    .frame(minHeight: 80, maxHeight: 200)
+                }
+            }
+
+            // MARK: Permission Editor
+            if let tokenID = selectedTokenID,
+                let token = tokens.first(where: { $0.id == tokenID })
+            {
+                Section {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Permissions for \"\(token.name)\"")
+                            .font(.headline)
+
+                        Text("Control which services this token can access.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.bottom, 4)
+
+                    HStack {
+                        Text("Set All")
+                            .fontWeight(.medium)
+                        Spacer()
+                        Button("Off") { setAllPermissions(.off, tokenID: tokenID) }
+                            .buttonStyle(.bordered)
+                        Button("Read-only") { setAllPermissions(.readOnly, tokenID: tokenID) }
+                            .buttonStyle(.bordered)
+                        Button("Full") { setAllPermissions(.full, tokenID: tokenID) }
+                            .buttonStyle(.bordered)
+                    }
+
+                    Divider()
+
+                    ForEach(serviceConfigs) { config in
+                        HStack {
+                            Image(systemName: config.iconName)
+                                .foregroundStyle(config.color)
+                                .frame(width: 20)
+                            Text(config.name)
+                            Spacer()
+                            Picker("", selection: permissionBinding(for: config.id, tokenID: tokenID)) {
+                                Text("Off").tag(ServicePermission.off)
+                                Text("Read-only").tag(ServicePermission.readOnly)
+                                Text("Full").tag(ServicePermission.full)
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 200)
+                        }
+                    }
                 }
             }
         }
         .formStyle(.grouped)
-        .alert("Revoke All Tool Approvals", isPresented: $showingResetAlert) {
+        .alert("Revoke All Tokens", isPresented: $showingRevokeAllAlert) {
             Button("Cancel", role: .cancel) {}
             Button("Revoke All", role: .destructive) {
-                serverController.resetToolApprovals()
+                selectedTokenID = nil
+                generatedToken = nil
+                serverController.revokeAllTokens()
             }
         } message: {
-            Text(
-                "This will revoke all tool approvals. Each tool will require confirmation again on next use."
-            )
+            Text("This will revoke all tokens. All connections will be rejected until new tokens are created.")
         }
     }
+
+    private func generateToken() {
+        let name = newTokenName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        let token = serverController.generateToken(name: name)
+        generatedToken = token
+        copiedTokenID = nil
+        newTokenName = ""
+        selectedTokenID = token.id
+    }
+
+    private func maskedToken(_ token: String) -> String {
+        guard token.count > 12 else { return token }
+        let prefix = token.prefix(6)
+        let suffix = token.suffix(6)
+        return "\(prefix)...\(suffix)"
+    }
+
+    private func setAllPermissions(_ permission: ServicePermission, tokenID: UUID) {
+        var permissions: [String: ServicePermission] = [:]
+        for config in serviceConfigs {
+            permissions[config.id] = permission
+        }
+        serverController.updateTokenPermissions(id: tokenID, permissions: permissions)
+    }
+
+    private func permissionBinding(for serviceID: String, tokenID: UUID) -> Binding<ServicePermission> {
+        Binding(
+            get: {
+                let tokens = serverController.getAuthTokens()
+                guard let token = tokens.first(where: { $0.id == tokenID }) else { return .off }
+                return token.permissions[serviceID] ?? .off
+            },
+            set: { newValue in
+                let tokens = serverController.getAuthTokens()
+                guard let index = tokens.firstIndex(where: { $0.id == tokenID }) else { return }
+                var permissions = tokens[index].permissions
+                permissions[serviceID] = newValue
+                serverController.updateTokenPermissions(id: tokenID, permissions: permissions)
+            }
+        )
+    }
 }
+
+// MARK: - Shortcuts Settings
 
 struct ShortcutsSettingsView: View {
     @ObservedObject var serverController: ServerController
@@ -308,6 +404,8 @@ struct ShortcutsSettingsView: View {
         newShortcutName = ""
     }
 }
+
+// MARK: - Automation Settings
 
 struct AutomationSettingsView: View {
     @ObservedObject var serverController: ServerController

@@ -41,6 +41,7 @@ actor StdioProxy {
     private let parameters: NWParameters
     private let stdinBufferSize: Int
     private let networkBufferSize: Int
+    private let authToken: String?
 
     // Connection state
     private var connection: NWConnection?
@@ -50,21 +51,18 @@ actor StdioProxy {
     private var networkToStdoutBuffer = Data()
 
     /// Creates a new StdioProxy with the specified network configuration
-    /// - Parameters:
-    ///   - endpoint: The network endpoint to connect to
-    ///   - parameters: Network connection parameters
-    ///   - stdinBufferSize: Buffer size for reading from stdin (default: 4096)
-    ///   - networkBufferSize: Buffer size for reading from network (default: 4096)
     init(
         endpoint: NWEndpoint,
         parameters: NWParameters = .tcp,
         stdinBufferSize: Int = 10 * 1024 * 1024,
-        networkBufferSize: Int = 10 * 1024 * 1024
+        networkBufferSize: Int = 10 * 1024 * 1024,
+        authToken: String? = nil
     ) {
         self.endpoint = endpoint
         self.parameters = parameters
         self.stdinBufferSize = stdinBufferSize
         self.networkBufferSize = networkBufferSize
+        self.authToken = authToken
     }
 
     /// Starts the proxy
@@ -99,6 +97,25 @@ actor StdioProxy {
                     )
                 }
             }
+        }
+
+        // Send auth token before any MCP traffic.
+        if let token = authToken {
+            let tokenData = Data((token + "\n").utf8)
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Swift.Error>) in
+                connection.send(
+                    content: tokenData,
+                    completion: .contentProcessed { error in
+                        if let error = error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                )
+            }
+            await log.debug("Sent auth token to server")
         }
 
         // Create a structured concurrency task group for handling I/O
@@ -463,6 +480,11 @@ enum StdioProxyError: Swift.Error {
 // Create MCPService class to manage lifecycle
 actor MCPService: Service {
     private var currentProxy: StdioProxy?
+    private let authToken: String?
+
+    init(authToken: String? = nil) {
+        self.authToken = authToken
+    }
 
     private static var portFileURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -502,7 +524,8 @@ actor MCPService: Service {
                     endpoint: endpoint,
                     parameters: parameters,
                     stdinBufferSize: 10 * 1024 * 1024,  // 10MB for large responses
-                    networkBufferSize: 10 * 1024 * 1024  // 10MB for large responses
+                    networkBufferSize: 10 * 1024 * 1024,  // 10MB for large responses
+                    authToken: authToken
                 )
                 self.currentProxy = proxy
 
@@ -539,10 +562,16 @@ actor MCPService: Service {
     }
 }
 
-// Update the ServiceLifecycle initialization
+// Parse --token argument
+var authToken: String?
+let args = CommandLine.arguments
+if let tokenIndex = args.firstIndex(of: "--token"), tokenIndex + 1 < args.count {
+    authToken = args[tokenIndex + 1]
+}
+
 let lifecycle = ServiceGroup(
     configuration: .init(
-        services: [MCPService()],
+        services: [MCPService(authToken: authToken)],
         logger: log
     )
 )

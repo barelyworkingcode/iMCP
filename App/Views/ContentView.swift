@@ -80,18 +80,9 @@ struct ContentView: View {
                 Divider()
 
                 MenuButton("Configure Claude Desktop", isMenuPresented: $isMenuPresented) {
-                    ClaudeDesktop.showConfigurationPanel()
+                    ClaudeDesktop.showConfigurationPanel(serverController: serverController)
                 }
 
-                MenuButton("Copy server command to clipboard", isMenuPresented: $isMenuPresented) {
-                    let command = Bundle.main.bundleURL
-                        .appendingPathComponent("Contents/MacOS/imcp-server")
-                        .path
-
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(command, forType: .string)
-                }
             }
             .padding(.top, 8)
             .padding(.bottom, 2)

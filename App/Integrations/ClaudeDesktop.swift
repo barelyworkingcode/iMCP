@@ -38,10 +38,23 @@ enum ClaudeDesktop {
         }
     }
 
-    static func showConfigurationPanel() {
+    @MainActor
+    static func showConfigurationPanel(serverController: ServerController) {
         do {
             log.debug("Loading existing Claude Desktop configuration")
-            let (config, imcpServer) = try loadConfig()
+
+            // Generate a token for Claude Desktop with full permissions on all services.
+            let token = serverController.generateToken(name: "Claude Desktop")
+            var fullPermissions: [String: ServicePermission] = [:]
+            for config in serverController.computedServiceConfigs {
+                fullPermissions[config.id] = .full
+            }
+            serverController.updateTokenPermissions(id: token.id, permissions: fullPermissions)
+
+            // Enable all services.
+            serverController.enableAllServices()
+
+            let (config, imcpServer) = try loadConfig(token: token.token)
 
             let fileExists = FileManager.default.fileExists(atPath: configPath)
 
@@ -52,6 +65,7 @@ enum ClaudeDesktop {
 
                 Location: \(configPath)
 
+                A new auth token has been generated with full access to all services. \
                 Your existing server configurations won't be affected.
                 """
 
@@ -66,7 +80,8 @@ enum ClaudeDesktop {
                 try updateConfig(config, upserting: imcpServer)
                 log.notice("Configuration updated successfully")
             } else {
-                log.debug("User cancelled configuration update")
+                log.debug("User cancelled, revoking generated token")
+                serverController.revokeToken(id: token.id)
             }
         } catch {
             log.error("Error configuring Claude Desktop: \(error.localizedDescription)")
@@ -114,12 +129,13 @@ private func saveSecurityScopedAccess(for url: URL) throws {
     log.debug("Successfully saved security-scoped bookmark")
 }
 
-private func loadConfig() throws -> ([String: Value], ClaudeDesktop.Config.MCPServer) {
+private func loadConfig(token: String) throws -> ([String: Value], ClaudeDesktop.Config.MCPServer) {
     log.debug("Creating default iMCP server configuration")
     let imcpServer = ClaudeDesktop.Config.MCPServer(
         command: Bundle.main.bundleURL
             .appendingPathComponent("Contents/MacOS/imcp-server")
-            .path
+            .path,
+        args: ["--token", token]
     )
 
     var loadedConfiguration: [String: Value]?

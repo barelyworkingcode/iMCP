@@ -3,16 +3,31 @@ import MCP
 import Network
 import OSLog
 import Ontology
+import Security
 import SwiftUI
 import SystemPackage
-import UserNotifications
-
 import struct Foundation.Data
 import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
 
 private let log = Logger.server
+
+// MARK: - Token Authentication Model
+
+enum ServicePermission: String, Codable, CaseIterable {
+    case off
+    case readOnly
+    case full
+}
+
+struct AuthToken: Codable, Identifiable {
+    let id: UUID
+    let name: String
+    let token: String
+    let createdAt: Date
+    var permissions: [String: ServicePermission]
+}
 
 struct ServiceConfig: Identifiable {
     let id: String
@@ -160,14 +175,6 @@ enum ServiceRegistry {
 @MainActor
 final class ServerController: ObservableObject {
     @Published var serverStatus: String = "Starting..."
-    @Published var pendingConnectionID: String?
-    @Published var pendingClientName: String = ""
-
-    private var activeApprovalDialogs: Set<String> = []
-    private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
-    private var currentApprovalHandlers: (approve: () -> Void, deny: () -> Void)?
-    private let approvalWindowController = ConnectionApprovalWindowController()
-    private let toolApprovalWindowController = ToolApprovalWindowController()
 
     private let networkManager = ServerNetworkManager()
 
@@ -184,12 +191,8 @@ final class ServerController: ObservableObject {
     @AppStorage("utilitiesEnabled") private var utilitiesEnabled = true  // Default enabled
     @AppStorage("weatherEnabled") private var weatherEnabled = false
 
-    // MARK: - AppStorage for Trusted Clients
-    @AppStorage("trustedClients") private var trustedClientsData = Data()
-
-    // MARK: - AppStorage for Per-Tool Approvals
-    // Maps client name -> set of approved tool names, stored as JSON.
-    @AppStorage("toolApprovals") private var toolApprovalsData = Data()
+    // MARK: - AppStorage for Auth Tokens
+    @AppStorage("authTokens") private var authTokensData = Data()
 
     // MARK: - AppStorage for Shortcuts Allowlist
     @AppStorage("allowedShortcuts") private var allowedShortcutsData = Data()
@@ -225,79 +228,91 @@ final class ServerController: ObservableObject {
         )
     }
 
-    // MARK: - Trusted Clients Management
-    private var trustedClients: Set<String> {
+    // MARK: - Auth Token Management
+    private var authTokens: [AuthToken] {
         get {
-            (try? JSONDecoder().decode(Set<String>.self, from: trustedClientsData)) ?? []
+            (try? JSONDecoder().decode([AuthToken].self, from: authTokensData)) ?? []
         }
         set {
-            trustedClientsData = (try? JSONEncoder().encode(newValue)) ?? Data()
+            authTokensData = (try? JSONEncoder().encode(newValue)) ?? Data()
         }
     }
 
-    private func isClientTrusted(_ clientName: String) -> Bool {
-        trustedClients.contains(clientName)
-    }
+    func generateToken(name: String) -> AuthToken {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
 
-    private func addTrustedClient(_ clientName: String) {
-        var clients = trustedClients
-        clients.insert(clientName)
-        trustedClients = clients
-    }
+        let token = AuthToken(
+            id: UUID(),
+            name: name,
+            token: hex,
+            createdAt: Date(),
+            permissions: [:]
+        )
 
-    func removeTrustedClient(_ clientName: String) {
-        var clients = trustedClients
-        clients.remove(clientName)
-        trustedClients = clients
-    }
+        var tokens = authTokens
+        tokens.append(token)
+        authTokens = tokens
 
-    func getTrustedClients() -> [String] {
-        Array(trustedClients).sorted()
-    }
-
-    func resetTrustedClients() {
-        trustedClients = Set<String>()
-    }
-
-    // MARK: - Per-Tool Approvals Management
-    private var toolApprovals: [String: Set<String>] {
-        get {
-            (try? JSONDecoder().decode([String: Set<String>].self, from: toolApprovalsData)) ?? [:]
+        Task {
+            await networkManager.setAuthTokens(self.authTokens)
         }
-        set {
-            toolApprovalsData = (try? JSONEncoder().encode(newValue)) ?? Data()
+
+        return token
+    }
+
+    func updateTokenPermissions(id: UUID, permissions: [String: ServicePermission]) {
+        var tokens = authTokens
+        guard let index = tokens.firstIndex(where: { $0.id == id }) else { return }
+        tokens[index].permissions = permissions
+        authTokens = tokens
+
+        Task {
+            await networkManager.setAuthTokens(self.authTokens)
         }
     }
 
-    func isToolApproved(client: String, tool: String) -> Bool {
-        toolApprovals[client]?.contains(tool) ?? false
-    }
+    func revokeToken(id: UUID) {
+        var tokens = authTokens
+        tokens.removeAll { $0.id == id }
+        authTokens = tokens
 
-    func approveToolForClient(client: String, tool: String) {
-        var approvals = toolApprovals
-        var clientTools = approvals[client] ?? []
-        clientTools.insert(tool)
-        approvals[client] = clientTools
-        toolApprovals = approvals
-    }
-
-    func getToolApprovals() -> [(client: String, tool: String)] {
-        toolApprovals.flatMap { client, tools in
-            tools.map { (client: client, tool: $0) }
-        }.sorted { ($0.client, $0.tool) < ($1.client, $1.tool) }
-    }
-
-    func revokeToolApproval(client: String, tool: String) {
-        var approvals = toolApprovals
-        approvals[client]?.remove(tool)
-        if approvals[client]?.isEmpty == true {
-            approvals.removeValue(forKey: client)
+        Task {
+            await networkManager.setAuthTokens(self.authTokens)
         }
-        toolApprovals = approvals
     }
 
-    func resetToolApprovals() {
-        toolApprovals = [:]
+    func revokeAllTokens() {
+        authTokens = []
+
+        Task {
+            await networkManager.setAuthTokens([])
+        }
+    }
+
+    func getAuthTokens() -> [AuthToken] {
+        authTokens
+    }
+
+    // MARK: - Service Enablement
+
+    func enableAllServices() {
+        calendarEnabled = true
+        captureEnabled = true
+        contactsEnabled = true
+        locationEnabled = true
+        mailEnabled = true
+        mapsEnabled = true
+        messagesEnabled = true
+        remindersEnabled = true
+        shortcutsEnabled = true
+        utilitiesEnabled = true
+        weatherEnabled = true
+
+        Task {
+            await networkManager.updateServiceBindings(self.currentServiceBindings)
+        }
     }
 
     // MARK: - Shortcuts Allowlist Management
@@ -346,103 +361,14 @@ final class ServerController: ObservableObject {
         }
     }
 
-    // MARK: - Connection Approval Methods
-    private func cleanupApprovalState() {
-        pendingClientName = ""
-        currentApprovalHandlers = nil
-
-        if let clientID = pendingConnectionID {
-            activeApprovalDialogs.remove(clientID)
-            pendingConnectionID = nil
-        }
-    }
-
-    private func handlePendingApprovals(for clientID: String, approved: Bool) {
-        while let pendingIndex = pendingApprovals.firstIndex(where: { $0.0 == clientID }) {
-            let (_, pendingApprove, pendingDeny) = pendingApprovals.remove(at: pendingIndex)
-            if approved {
-                log.notice("Approving pending connection for client: \(clientID)")
-                pendingApprove()
-            } else {
-                log.notice("Denying pending connection for client: \(clientID)")
-                pendingDeny()
-            }
-        }
-    }
-
     init() {
         Task {
-            // Initialize bindings from AppStorage before the server starts.
+            // Initialize bindings and tokens before the server starts.
             await networkManager.updateServiceBindings(self.currentServiceBindings)
+            await networkManager.setAuthTokens(self.authTokens)
             await self.networkManager.start()
             self.updateServerStatus("Running")
             self.updateMessageWatcher()
-
-            await networkManager.setConnectionApprovalHandler {
-                [weak self] connectionID, clientInfo in
-                guard let self = self else {
-                    return false
-                }
-
-                log.debug("ServerManager: Approval handler called for client \(clientInfo.name)")
-
-                // Bridge approval UI actions back into the async handler.
-                return await withCheckedContinuation { continuation in
-                    let resumeGate = ResumeGate()
-                    let resumeOnce: (Bool) async -> Void = { value in
-                        guard await resumeGate.shouldResume() else { return }
-                        continuation.resume(returning: value)
-                    }
-
-                    Task { @MainActor in
-                        self.showConnectionApprovalAlert(
-                            clientID: clientInfo.name,
-                            approve: {
-                                Task { await resumeOnce(true) }
-                            },
-                            deny: {
-                                Task { await resumeOnce(false) }
-                            }
-                        )
-                    }
-                }
-            }
-
-            await networkManager.setToolApprovalHandler {
-                [weak self] clientName, toolName in
-                guard let self = self else { return false }
-
-                // Check if already approved.
-                let alreadyApproved = await MainActor.run {
-                    self.isToolApproved(client: clientName, tool: toolName)
-                }
-                if alreadyApproved { return true }
-
-                // Show approval dialog.
-                return await withCheckedContinuation { continuation in
-                    let resumeGate = ResumeGate()
-                    let resumeOnce: (Bool) async -> Void = { value in
-                        guard await resumeGate.shouldResume() else { return }
-                        continuation.resume(returning: value)
-                    }
-
-                    Task { @MainActor in
-                        self.toolApprovalWindowController.showApprovalWindow(
-                            clientName: clientName,
-                            toolName: toolName,
-                            onApprove: { alwaysAllow in
-                                if alwaysAllow {
-                                    self.approveToolForClient(client: clientName, tool: toolName)
-                                }
-                                Task { await resumeOnce(true) }
-                            },
-                            onDeny: {
-                                Task { await resumeOnce(false) }
-                            }
-                        )
-                    }
-                }
-            }
         }
     }
 
@@ -471,93 +397,6 @@ final class ServerController: ObservableObject {
         self.serverStatus = status
     }
 
-    private func sendClientConnectionNotification(clientName: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "Client Connected"
-        content.body = "Client '\(clientName)' has connected to iMCP"
-        content.threadIdentifier = "client-connection-\(clientName)"
-
-        let request = UNNotificationRequest(
-            identifier: "client-connection-\(clientName)-\(Date().timeIntervalSince1970)",
-            content: content,
-            trigger: nil
-        )
-
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error = error {
-                log.error("Failed to send notification: \(error.localizedDescription)")
-            } else {
-                log.info("Sent notification for client connection: \(clientName)")
-            }
-        }
-    }
-
-    private func showConnectionApprovalAlert(
-        clientID: String,
-        approve: @escaping () -> Void,
-        deny: @escaping () -> Void
-    ) {
-        log.notice("Connection approval requested for client: \(clientID)")
-
-        // Trusted clients auto-approve without showing the dialog.
-        if isClientTrusted(clientID) {
-            log.notice("Client \(clientID) is already trusted, auto-approving")
-            approve()
-
-            // Notify the user on auto-approved connections.
-            sendClientConnectionNotification(clientName: clientID)
-
-            return
-        }
-
-        self.pendingConnectionID = clientID
-
-        // Coalesce concurrent approvals for the same client.
-        guard !activeApprovalDialogs.contains(clientID) else {
-            log.info("Adding to pending approvals for client: \(clientID)")
-            pendingApprovals.append((clientID, approve, deny))
-            return
-        }
-
-        activeApprovalDialogs.insert(clientID)
-
-        // Present the approval window and wire callbacks.
-        pendingClientName = clientID
-        currentApprovalHandlers = (approve: approve, deny: deny)
-
-        approvalWindowController.showApprovalWindow(
-            clientName: clientID,
-            onApprove: { alwaysTrust in
-                if alwaysTrust {
-                    self.addTrustedClient(clientID)
-
-                    // Ask for notification permission to alert on future trusted connections.
-                    UNUserNotificationCenter.current().requestAuthorization(options: [
-                        .alert, .sound, .badge,
-                    ]) { granted, error in
-                        if let error = error {
-                            log.error(
-                                "Failed to request notification permissions: \(error.localizedDescription)"
-                            )
-                        } else {
-                            log.info("Notification permissions granted: \(granted)")
-                        }
-                    }
-                }
-
-                approve()
-                self.cleanupApprovalState()
-                self.handlePendingApprovals(for: clientID, approved: true)
-            },
-            onDeny: {
-                deny()
-                self.cleanupApprovalState()
-                self.handlePendingApprovals(for: clientID, approved: false)
-            }
-        )
-
-        NSApp.activate(ignoringOtherApps: true)
-    }
 }
 
 // MARK: - Connection Management Components
@@ -569,12 +408,14 @@ actor MCPConnectionManager {
     private let server: MCP.Server
     private var transport: NetworkTransport
     private let parentManager: ServerNetworkManager
+    let authenticatedToken: AuthToken
     private(set) var clientName: String?
 
-    init(connectionID: UUID, connection: NWConnection, parentManager: ServerNetworkManager) {
+    init(connectionID: UUID, connection: NWConnection, parentManager: ServerNetworkManager, authenticatedToken: AuthToken) {
         self.connectionID = connectionID
         self.connection = connection
         self.parentManager = parentManager
+        self.authenticatedToken = authenticatedToken
 
         self.transport = NetworkTransport(
             connection: connection,
@@ -594,7 +435,7 @@ actor MCPConnectionManager {
         )
     }
 
-    func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws {
+    func start() async throws {
         do {
             log.notice("Starting MCP server for connection: \(self.connectionID)")
             try await server.start(transport: transport) { [weak self] clientInfo, capabilities in
@@ -602,24 +443,13 @@ actor MCPConnectionManager {
 
                 log.info("Received initialize request from client: \(clientInfo.name)")
 
-                // Store the client name for later use in tool approval.
-                await self.setClientName(clientInfo.name)
-
-                // Request user approval for the connection.
-                let approved = await approvalHandler(clientInfo)
-                log.info(
-                    "Approval result for connection \(connectionID): \(approved ? "Approved" : "Denied")"
-                )
-
-                if !approved {
-                    await self.parentManager.removeConnection(self.connectionID)
-                    throw MCPError.connectionClosed
-                }
+                // Use the authenticated token name as the canonical client name.
+                await self.setClientName(self.authenticatedToken.name)
             }
 
             log.notice("MCP Server started successfully for connection: \(self.connectionID)")
 
-            // Register handlers after successful approval.
+            // Register handlers with token-based permission enforcement.
             await registerHandlers()
 
             // Monitor connection health for early disconnects.
@@ -635,7 +465,7 @@ actor MCPConnectionManager {
     }
 
     private func registerHandlers() async {
-        await parentManager.registerHandlers(for: server, connectionID: connectionID, clientName: clientName)
+        await parentManager.registerHandlers(for: server, connectionID: connectionID, token: authenticatedToken)
     }
 
     private func startHealthMonitoring() async {
@@ -739,8 +569,25 @@ actor NetworkDiscoveryManager {
         let dir = url.deletingLastPathComponent()
 
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: dir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+
+            // Repair existing directory permissions for upgrades.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: dir.path
+            )
+
             try "\(port.rawValue)".write(to: url, atomically: true, encoding: .utf8)
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
+
             log.info("Wrote port file: \(url.path) with port \(port.rawValue)")
         } catch {
             log.error("Failed to write port file: \(error)")
@@ -792,12 +639,7 @@ actor ServerNetworkManager {
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
 
-    typealias ConnectionApprovalHandler = @Sendable (UUID, MCP.Client.Info) async -> Bool
-    private var connectionApprovalHandler: ConnectionApprovalHandler?
-
-    /// Returns true if the tool is approved (or user approved it now).
-    typealias ToolApprovalHandler = @Sendable (String, String) async -> Bool  // (clientName, toolName)
-    private var toolApprovalHandler: ToolApprovalHandler?
+    private var authTokens: [AuthToken] = []
 
     private let services = ServiceRegistry.services
     private var serviceBindings: [String: Binding<Bool>] = [:]
@@ -814,14 +656,78 @@ actor ServerNetworkManager {
         isRunningState
     }
 
-    func setConnectionApprovalHandler(_ handler: @escaping ConnectionApprovalHandler) {
-        log.debug("Setting connection approval handler")
-        self.connectionApprovalHandler = handler
+    func setAuthTokens(_ tokens: [AuthToken]) {
+        self.authTokens = tokens
     }
 
-    func setToolApprovalHandler(_ handler: @escaping ToolApprovalHandler) {
-        log.debug("Setting tool approval handler")
-        self.toolApprovalHandler = handler
+    // MARK: - Token Validation
+
+    /// Constant-time comparison to prevent timing attacks.
+    private static func constantTimeCompare(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        guard aBytes.count == bBytes.count else { return false }
+        var result: UInt8 = 0
+        for i in 0..<aBytes.count {
+            result |= aBytes[i] ^ bBytes[i]
+        }
+        return result == 0
+    }
+
+    /// Reads a newline-terminated token from a raw NWConnection with a timeout.
+    private func validateToken(on connection: NWConnection, timeout: TimeInterval = 5.0) async -> AuthToken? {
+        // Snapshot tokens before entering Sendable closure.
+        let tokensSnapshot = authTokens
+
+        // Race: receive vs timeout.
+        let data: Data? = await withCheckedContinuation { continuation in
+            let gate = ResumeGate()
+
+            // Timeout.
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                Task {
+                    guard await gate.shouldResume() else { return }
+                    log.warning("Token validation timed out")
+                    continuation.resume(returning: nil as Data?)
+                }
+            }
+
+            // Receive.
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, error in
+                Task {
+                    guard await gate.shouldResume() else { return }
+                    if let data = data, error == nil {
+                        continuation.resume(returning: data)
+                    } else {
+                        log.warning("Token receive failed: \(error?.localizedDescription ?? "no data")")
+                        continuation.resume(returning: nil as Data?)
+                    }
+                }
+            }
+        }
+
+        guard let data = data else { return nil }
+
+        // Extract the first newline-terminated line as the token.
+        guard let line = String(data: data, encoding: .utf8)?
+            .components(separatedBy: "\n")
+            .first?
+            .trimmingCharacters(in: .whitespaces),
+            !line.isEmpty
+        else {
+            log.warning("Token receive: empty or invalid data")
+            return nil
+        }
+
+        // Constant-time compare against each configured token.
+        for authToken in tokensSnapshot {
+            if Self.constantTimeCompare(line, authToken.token) {
+                return authToken
+            }
+        }
+
+        log.warning("Token validation failed: no matching token")
+        return nil
     }
 
     func start() async {
@@ -956,37 +862,72 @@ actor ServerNetworkManager {
         pendingConnections.removeValue(forKey: id)
     }
 
-    // Handle new incoming connections.
+    // Handle new incoming connections with token authentication.
     private func handleNewConnection(_ connection: NWConnection) async {
         let connectionID = UUID()
         log.info("Handling new connection: \(connectionID)")
 
+        // Reject if no tokens are configured.
+        guard !authTokens.isEmpty else {
+            log.warning("No auth tokens configured, rejecting connection \(connectionID)")
+            connection.cancel()
+            return
+        }
+
+        // Start the connection so we can read the token.
+        connection.start(queue: .main)
+
+        // Wait for the connection to become ready.
+        let ready: Bool = await withCheckedContinuation { continuation in
+            let gate = ResumeGate()
+            connection.stateUpdateHandler = { state in
+                Task {
+                    switch state {
+                    case .ready:
+                        guard await gate.shouldResume() else { return }
+                        continuation.resume(returning: true)
+                    case .failed, .cancelled:
+                        guard await gate.shouldResume() else { return }
+                        continuation.resume(returning: false)
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+
+        guard ready else {
+            log.warning("Connection \(connectionID) failed to reach ready state")
+            connection.cancel()
+            return
+        }
+
+        // Validate the token from the raw connection.
+        guard let matchedToken = await validateToken(on: connection) else {
+            log.warning("Connection \(connectionID) rejected: invalid or missing token")
+            connection.cancel()
+            return
+        }
+
+        log.notice("Connection \(connectionID) authenticated as '\(matchedToken.name)'")
+
+        // Token consumed -- create the MCP connection manager.
         let connectionManager = MCPConnectionManager(
             connectionID: connectionID,
             connection: connection,
-            parentManager: self
+            parentManager: self,
+            authenticatedToken: matchedToken
         )
 
         connections[connectionID] = connectionManager
 
-        // Drive the MCP handshake and approval flow.
         let task = Task {
-            // Ensure this task is removed so the timeout logic doesn't fire afterward.
             defer {
                 self.connectionTasks.removeValue(forKey: connectionID)
             }
 
             do {
-                guard let approvalHandler = self.connectionApprovalHandler else {
-                    log.error("No connection approval handler set, rejecting connection")
-                    await removeConnection(connectionID)
-                    return
-                }
-
-                try await connectionManager.start { clientInfo in
-                    await approvalHandler(connectionID, clientInfo)
-                }
-
+                try await connectionManager.start()
                 log.notice("Connection \(connectionID) successfully established")
             } catch {
                 log.error("Failed to establish connection \(connectionID): \(error)")
@@ -1000,7 +941,6 @@ actor ServerNetworkManager {
         Task {
             try? await Task.sleep(nanoseconds: 10_000_000_000)  // 10 seconds
 
-            // If the setup task is still registered, treat it as timed out.
             if self.connectionTasks[connectionID] != nil,
                 self.connections[connectionID] != nil
             {
@@ -1012,7 +952,34 @@ actor ServerNetworkManager {
         }
     }
 
-    func registerHandlers(for server: MCP.Server, connectionID: UUID, clientName: String? = nil) async {
+    /// Builds a lookup from tool name to service ID for permission enforcement.
+    private func buildToolServiceMap() -> [String: String] {
+        var map: [String: String] = [:]
+        for service in services {
+            let serviceId = String(describing: type(of: service))
+            for tool in service.tools {
+                map[tool.name] = serviceId
+            }
+        }
+        return map
+    }
+
+    /// Checks whether a token permits the given tool based on its service permission.
+    private nonisolated func isToolPermitted(_ tool: Tool, serviceId: String, token: AuthToken) -> Bool {
+        let permission = token.permissions[serviceId] ?? .off
+        switch permission {
+        case .off:
+            return false
+        case .readOnly:
+            return tool.annotations.readOnlyHint == true
+        case .full:
+            return true
+        }
+    }
+
+    func registerHandlers(for server: MCP.Server, connectionID: UUID, token: AuthToken) async {
+        let toolServiceMap = buildToolServiceMap()
+
         await server.withMethodHandler(ListPrompts.self) { _ in
             log.debug("Handling ListPrompts request for \(connectionID)")
             return ListPrompts.Result(prompts: [])
@@ -1035,26 +1002,28 @@ actor ServerNetworkManager {
                 for service in await self.services {
                     let serviceId = String(describing: type(of: service))
 
-                    // Read binding on the actor for consistency.
+                    // Check global service toggle.
                     if let isServiceEnabled = await self.serviceBindings[serviceId]?.wrappedValue,
                         isServiceEnabled
                     {
                         for tool in service.tools {
-                            log.debug("Adding tool: \(tool.name)")
-                            tools.append(
-                                .init(
-                                    name: tool.name,
-                                    description: tool.description,
-                                    inputSchema: tool.inputSchema,
-                                    annotations: tool.annotations
+                            // Check token permission for this service.
+                            if self.isToolPermitted(tool, serviceId: serviceId, token: token) {
+                                tools.append(
+                                    .init(
+                                        name: tool.name,
+                                        description: tool.description,
+                                        inputSchema: tool.inputSchema,
+                                        annotations: tool.annotations
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 }
             }
 
-            log.info("Returning \(tools.count) available tools for \(connectionID)")
+            log.info("Returning \(tools.count) available tools for \(connectionID) (\(token.name))")
             return ListTools.Result(tools: tools)
         }
 
@@ -1066,7 +1035,7 @@ actor ServerNetworkManager {
                 )
             }
 
-            log.notice("Tool call received from \(connectionID): \(params.name)")
+            log.notice("Tool call received from \(connectionID) (\(token.name)): \(params.name)")
 
             guard await self.isEnabledState else {
                 log.notice("Tool call rejected: iMCP is disabled")
@@ -1076,13 +1045,24 @@ actor ServerNetworkManager {
                 )
             }
 
-            // Per-tool approval check.
-            if let client = clientName, let approvalHandler = await self.toolApprovalHandler {
-                let approved = await approvalHandler(client, params.name)
-                if !approved {
-                    log.notice("Tool call denied by user: \(params.name) for client \(client)")
+            // Permission enforcement: check token permissions for this tool.
+            if let serviceId = toolServiceMap[params.name] {
+                // Find the tool to check its annotations.
+                var permitted = false
+                for service in await self.services {
+                    let sid = String(describing: type(of: service))
+                    guard sid == serviceId else { continue }
+                    for tool in service.tools where tool.name == params.name {
+                        permitted = self.isToolPermitted(tool, serviceId: serviceId, token: token)
+                        break
+                    }
+                    break
+                }
+
+                if !permitted {
+                    log.notice("Tool call denied by permissions: \(params.name) for \(token.name)")
                     return CallTool.Result(
-                        content: [.text("Tool '\(params.name)' was denied by the user.")],
+                        content: [.text("Permission denied: '\(params.name)' is not allowed for this token.")],
                         isError: true
                     )
                 }
@@ -1091,7 +1071,7 @@ actor ServerNetworkManager {
             for service in await self.services {
                 let serviceId = String(describing: type(of: service))
 
-                // Read binding on the actor for consistency.
+                // Check global service toggle.
                 if let isServiceEnabled = await self.serviceBindings[serviceId]?.wrappedValue,
                     isServiceEnabled
                 {
