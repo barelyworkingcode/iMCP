@@ -10,6 +10,12 @@
 > into the repository to ensure full auditability of what runs on your machine.
 > Thanks to [Mattt](https://github.com/mattt) and all contributors for the original project.
 
+> **Note:** I've decided to go in a different direction favoring a tool agnosting relay
+> and separating out macMCPs into a standalone project that can be loaded into relay
+> see [Relay](https://github.com/barelyworkingcode/relay) and [macMCP](https://github.com/barelyworkingcode/macMCP)
+> Leaving this version of iMCP up in case anyone wants my additions.
+
+
 iMCP is a macOS app for connecting your digital life with AI.
 It works with [Claude Desktop][claude-app]
 and a [growing list of clients][mcp-clients] that support the
